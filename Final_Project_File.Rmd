@@ -1,0 +1,609 @@
+---
+title: "Automotive Auctioneering Antics: Predicting Price with Dealer-Provided Datapoints"
+author: "Marina Cui, Sam You, Oliver Yun"
+date: "`r Sys.Date()`"
+output: openintro::lab_report
+editor_options: 
+  chunk_output_type: console
+---
+```{r load-packages, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(openintro)
+library(broom)
+library(devtools)
+library(magicfor)
+library(lubridate)
+library(tidymodels)
+library(corrplot)
+library(knitr)
+```
+
+```{r chunk-options, echo = FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r load-data}
+auction_df <- read_csv(file = "USA_cars_datasets.csv")
+```
+## Introduction
+  The dataset [US Cars Dataset](https://kaggle.com/doaaalsenani/usa-cers-dataset) is excerpted from [Kaggle](https://www.kaggle.com), as published by Kaggle user _Doaa Alsenani_. The data was scraped from Auction Export.com by the aforementioned Kaggle user in April 2020. This dataset contains data on cars listed on _Auction Export.com_, a car auctioning website, up to year 2020. Each case is an auctioned car, and the variables pertain to information on the car condition and price. The dataset contains 2499 observations of 13 variables, an additional six being mutated for this analysis. Relevant variables are listed in the codebook below.
+
+  Kaggle lists sixty-nine projects completed in the coding language "Python", primarily related to exploratory data analysis. The top three listed projects as sorted by number of votes pertain to exploratory data analysis and graphing price distribution by variables such as vehicle year and model. Similarly, we aim to evaluate predictors that determine buyer behavior, particularly regarding auction sale price. Thus, we attempt to find the relationship between vehicle age and the time left on auction, as well as the extent to which vehicle title status (whether the car has been "totaled" or "written off" by insurance), vehicle age, vehicle mileage, brand, and vehicle body type correlate with vehicle sale price. This question is particularly interesting because common anecdotal experience is that vehicle value - and commensurately, buyer willingness to buy - declines steeply before beginning to level out, in a manner somewhat similar to an asymptotic function. Whether this effect appears in auction data is of particular interest for car buying and selling.
+  
+Variable Name | Description
+--------------|--------------
+`price`     	|Vehicle sale price in advert (continuous).
+`brand`    	  |Vehicle manufacturer brand name (categorical).
+`model`       |Vehicle model name (categorical).
+`year`      	|Vehicle registration year (categorical).
+`title_status`|Binary predictor of whether the vehicle is clean or salvage insurance (has been totaled) (binary categorical).
+`mileage` 	  |Miles hitherto traveled by vehicle (continuous numerical).
+`vin`     	  |Vehicle Identification Number (categorical).
+`condition`   |Time left on auction (chr) (categorical).
+`hours_left`  |Condition mutated into numeric form, measuring hours left in the auction (continuous).
+`years_old`   |Year mutated into a more easily interpretable form (continuous).
+`sqrtPrice`   |Square-root transformation of price (continuous).
+`sqrtMileage` |Square-root transformation of mileage (continuous).
+`vehicle_body`|Model mutated through manual searching (categorical),
+`vehicle_type`|Vehicle body mutated into a two-level categorical (categorical).
+
+### Data Wrangling and EDA
+  First, as the condition variable measures time, it is important to convert it into a numerical variable for ease of use and future conversion. Currently there are forty-seven string values for condition, making it impossible to use as a continuous variable and overly complex as a categorical variable.
+  
+```{r hours-left}
+# convert condition into hours and mutate a new column hours_left
+var2nd <- word(auction_df$condition, 2)
+nums <- as.numeric(word(auction_df$condition, 1))
+magic_for(silent = TRUE)
+hours_left <- for (i in seq_along(auction_df$condition)) {
+  if (var2nd[i] == "days") {
+	b = nums[i]*24
+	hr = paste(b, "hours left")
+	put(hr)
+  } else if ( var2nd[i] == "minutes") {
+	d <- round(nums[i]/60, digits = 2)
+	hr <- paste(d, "hours left")
+	put(hr)
+  } else if (var2nd[i] == "Expired") {
+	hr <- "Listing Expired"
+	put(hr)
+  } else if (var2nd[i] == "hours") {
+	hr <- paste(nums[i], "hours left")
+	put(hr)
+  }
+}
+hours_left <- magic_result_as_vector()
+auction_df <- mutate(auction_df, hours_left)
+ 
+# extracts the hour in the first token to get a double type column
+auction_df <- auction_df %>%
+  mutate(hours_left = as.numeric(word(auction_df$hours_left, 1)))
+```
+
+  Second, year also measures time but is somewhat overly complex. Converting year into vehicle age by subtracting vehicle registration year from year of data scraping gives a variable with more easily interpretable estimates and intercept.
+  
+```{r vehicle-years-old}
+# converts "year" (vehicle registration year) into a more manageable/interpretable form.
+auction_df <- auction_df %>% mutate(years_old = (2020 - year))
+
+#ggplot of distribution
+ggplot(data = auction_df, mapping = aes(x = years_old)) +
+  geom_histogram() +
+  labs(title = "Distribution of Vehicle Registration Year",
+       x = "Vehicle Age (Years)",
+       y = "Count")
+```
+
+  Third, as price is skewed right, a square-root transformation normalizes the dataset and makes it more possible to construct a linear model.
+  
+```{r price-transformation}
+#Transforming price through a square-root normalisation
+auction_df <- auction_df %>% mutate(sqrtPrice = sqrt(price))
+
+#ggplot of distribution
+ggplot(data = auction_df, mapping = aes(x = sqrtPrice)) + 
+  geom_histogram(binwidth = 17) +
+  labs(title = "Distribution of Vehicle Auction Price",
+       x = "Vehicle Auction Price (Square-Root Transformed)",
+       y = "Count")
+```
+
+  Fourth, mileage is similarly skewed right, and a square-root transformation assists in model construction.
+  
+```{r mileage-transformation}
+#Transforming mileage through a square-root normalisation
+auction_df <- auction_df %>% mutate(sqrtMileage = sqrt(mileage))
+
+#ggplot of distribution
+ggplot(data = auction_df, mapping = aes(x = sqrtMileage)) + 
+  geom_histogram(binwidth = 33) +
+  labs(title = "Distribution of Vehicle Mileage",
+       x = "Vehicle Mileage (Square-Root Transformed)",
+       y = "Count")
+```
+
+  Finally, the high number of distinct values for variable "model" make its use as a categorical variable difficult. Through manual Google searching and VIN lookup, the values can be converted into more easily understandable categories of vehicle body type. Nevertheless, several deficiencies remain in the new variable of vehicle body.
+  <br>
+  Firstly, vehicle information was unavailable for observations with listed make "Heartland" and model "Country". As Heartland is an RV manufacturer, all vehicles with make "Heartland" were classified as large commercial vehicles.
+  <br>
+  Secondly, four-hundred vehicles are listed with make "door" or "doors", likely due to a scraping error when producing the original dataset. A cursory, manual sampling of several VIN numbers indicated that the aformentioned two incorrect values covered multiple vehicle types produced by multiple manufacturers. Vehicles with "door" and "doors" as listed model names have therefore been listed as having "NA" vehicle body type.
+  <br>
+  Thirdly, data was not available for the observation with listed make "Ford" and model "dr", even with a VIN lookup. It has therefore been left as having "NA" vehicle body type. Nevertheless, two-thousand eighty-six observations have had variable vehicle_body added for analysis.
+  Finally, there is only one motorcycle within the dataset.
+  
+```{r model-transform}
+auction_df <- auction_df %>% mutate(across(.cols = everything()), .fns = (vehicle_body = case_when
+                                                                   (model %in% c("1500", "f-150","srw","pickup",
+                                                                  "frontier","colorado","drw","2500",
+                                                                  "cab","ranger","pk","titan","3500","chassis","truck","el","ld","2500hd",
+                                                                  "sierra","utility","xd","limited") ~ "truck",
+                                                    model %in% c("caravan","mpv","durango","journey","rogue","van","max","edge",
+                                                              "flex","wagon","expedition","pathfinder","equinox","suburban","tahoe",
+                                                              "compass","traverse","murano","sorento","armada","cherokee",
+                                                                "pacifica","enclave","x3","acadia","cruiser","cx-3","discovery",
+                                                              "esv","glc","juke","m","mdx","nautilus","q5","sportage","srx",
+                                                              "suv","vehicl","xterra","xt5","explorer") ~ "van_suv",
+                                                    model %in% c("cutaway", "transit","f-650","passenger","bus","cargo",
+                                                                 "vans","connect","f-750","nvp","pioneer","sundance","trail","country") ~ "commercial",
+                                                    model %in% c("fusion","charger","versa","sentra","altima",
+                                                                 "impala","malibu","taurus","series","300","versa","maxima","cruze",
+                                                                 "forte","gle","volt","dart","e-class","elantra","energi","ghibli",
+                                                                 "gx","q70","sedan") ~  "sedan",
+                                                    model %in% c("challenger","mustang","camaro","coupe","corvette","5",
+                                                                 "convertible","sl-class") ~ "sports",
+                                                    model %in% c("max","ecosport","escape","sport","fiesta","focus","trax","encore",
+                                                                 "note","sonic","kicks","se","soul","spark") ~ "compact",
+                                                    model %in% c("road/street") ~ "motorcycle",
+                                                    (model == "door" & brand == "ford") ~ "truck",
+                                                    (model == "door" & brand == "gmc") ~ "van_suv",
+                                                    (vin == "1fadp5au1gl114180") ~ "compact",
+                                                    (vin %in% c("3fa6p0ru4kr181558","3fa6p0lu6kr119958",
+                                                                "3fa6p0lu4kr188583","3fa6p0ru6kr257894")) ~ "sedan",
+                                                    (vin == "maj3s2ge4kc278721") ~ "compact",
+                                                    (vin == "nm0ls7f70g1257651") ~ "commercial",
+                                                    (vin == "2gnflhe33f6214023") ~ "van_suv",
+                                                    ))) %>% rename(vehicle_body = .fns)
+
+ggplot(data = auction_df, mapping = aes(x = price, y = vehicle_body)) + geom_boxplot()
+```
+
+## Analysis
+### Linear Modeling
+#### Variables
+  Sorting through the variables after establishing price as the response variable, the remaining continuous explanatory variables are mileage normalised through a square-root transformation, lot, vehicle age in years (years_old), and hours left in auction (hours_left). 
+
+  In order, it is expected, on average; people are less willing to buy more heavily used vehicles, such that an increase in mileage should negatively correlate; lot has no correlation with price; people are less willing to buy older vehicles, such that an increase in how many years old a vehicle is will negatively correlate; and people will rush to put bids on auctions about to close, thus hours left should negatively correlate. 
+  
+```{r corr}
+priceCorr <- auction_df %>% select(contains("sqrtPrice"), sqrtPrice, sqrtMileage, lot, years_old,hours_left) %>% cor(use = "complete.obs")
+
+corrplot(priceCorr)
+```
+
+  However, the above correlation plot indicates that mileage and vehicle age correlate most strongly with price, while having a negative correlation with each other. Lot number has a minor positive correlation with price, indicating the likely presence of noise. Hours left in the auction has no correlation with price, mileage, or vehicle age, perhaps indicating that bidding generally occurs relatively early in the auction process - it is, in any case, irrelevant to the question of price. The two primary numerical variables are, therefore, vehicle age and mileage.
+
+  This leaves the categorical variables of brand, body (replacing the poorly scraped variable "model"), title status, color, and state (replacing country, as the two comprise a single dimension).
+  
+```{r data-split}
+#Splitting the dataset
+set.seed(500)
+auction_split <- auction_df %>% initial_split()
+
+auction_train <- training(auction_split) 
+auction_test <- testing(auction_split)
+```
+
+#### Model 1
+```{r model1-preliminary}
+auction_df %>% count(brand) %>% arrange(desc(n))
+
+ggplot(data = (auction_df %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz"))), 
+       mapping = aes(x = sqrtMileage, y = sqrtPrice, colour = title_status)) +
+  facet_wrap(~brand) +
+  geom_point(position = "jitter") +
+  geom_smooth(method = "lm") +
+  labs(x = "Miles on Vehicle (Square Root-transformed)",
+       y = "Auction Price (Square Root-transformed)",
+       title = "Auction Price against Miles on Vehicle",
+       tubtitle = "Faceted by Brand, Disagreggated by Title Status")
+```
+
+There are several brands with few datapoints. This small sample size precludes the derivation of an accurate model, so brands with fewer than ten observations in the dataset have been eliminated. Model 1 is therefore constructed on the training split, using variables mileage (square-root transformed), brand, and title status.
+
+```{r model1}
+#Creating Model 1 with the training data
+model_1 <- lm(sqrtPrice ~ sqrtMileage * brand * title_status,
+                    data = auction_train %>% filter(!is.na(hours_left)) %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz")))
+
+tidy_model_1 <- tidy(model_1)
+glance(model_1) %>% select(r.squared,adj.r.squared)
+```
+
+Model 1 returns an r-squared value of 0.540, indicating that 54.0% of auction price variance is explained by the model.
+
+```{r model1-augment-RMSE-rsquared}
+#RMSE for both data splits
+model_1_aug <- augment(model_1, newdata = (auction_train %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz"))))
+model_1_augR <- augment(model_1, newdata = (auction_test %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz"))))
+
+RMSE <- model_1_aug %>% filter(!is.na(.resid)) %>% summarise(RMSE = sqrt(mean(.resid^2)))
+RMSEaug <- model_1_augR %>% filter(!is.na(.resid)) %>% summarise(RMSEaug = sqrt(mean(.resid^2)))
+```
+
+In this subsection, we evaluate RMSE values for Model 1, utilising both the training and testing splits. A high discrepancy between the two values, if present, would indicate that Model 1 captures too much of the noise in the training split, such that it will have limited success on unseen testing datasets. The RMSE values are `r RMSE` and `r RMSEaug` for training and testing, respectively, indicating that there is no overfitting problem.
+
+```{r model1-residual}
+#Residual Plot
+ggplot(model_1_aug, 
+       mapping = aes(x = .fitted, y = .resid)) +
+  geom_point(position = "jitter") +
+  geom_hline(yintercept = 0,
+             color = "red", lty = "dashed", size=2) +
+  labs(x = "Predicted", y = "Residuals",
+       title="Residual plot")
+```
+
+In this subsection, we manually evaluate the residual plots to search for undesired patterns, which, if present, would indicate that a linear model is inappropriate for the dataset. There are no large-scale trends, thus indicating that Model 1 is appropriate for the dataset.
+
+#### Model 2
+This subsection evaluates r-squared values as compared between main and interaction effects models, maintaining the same three set of explanatory variables - sqrtMileage, brand, and title_status. This is for the purpose of evaluating a possible Occam's razor-derived trade-off between model explanatory power and complexity, where if the main effects model is close in explanatory ability while being significantly simpler, Occam's razor demands that it be selected over the the interaction effects model. Once again, brands with fewer than ten observations in the dataset will be eliminated.
+
+```{r model2}
+#Creating Model 2 on auction_train
+model_2 <- lm(sqrtPrice ~ sqrtMileage + brand + title_status,
+                    data = auction_train %>% filter(!is.na(hours_left)) %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz")))
+
+tidy_model_2 <- tidy(model_2)
+glance(model_2) %>% select(r.squared,adj.r.squared)
+```
+
+Model 2 returns an r-squared value of 0.508, indicating that 50.8% of the variance is explained by the model. 
+
+```{r model2-augment-RMSE-rsquared}
+#Testing the RMSE for both splits of data
+model_2_aug <- augment(model_2, newdata = (auction_train %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz"))))
+model_2_augR <- augment(model_2, newdata = (auction_test %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz"))))
+
+RMSE2 <- model_2_aug %>% filter(!is.na(.resid)) %>% summarise(RMSE = sqrt(mean(.resid^2)))
+RMSEaug2 <- model_2_augR %>% filter(!is.na(.resid)) %>% summarise(RMSEaug = sqrt(mean(.resid^2)))
+```
+
+Having created model two, we then test it on the testing data and training data. A high discrepancy between the RMSE values for their respective data splits indicates overfitting, which in turn indicates that the model captures too much noise in the training data, such that it has limited success on unseen datasets (in this case, the testing data). The small difference between the values for training and testing, `r RMSE2` and `r RMSEaug2`, respectively, indicate there is no overfitting problem.
+
+```{r model2-residual}
+ggplot(model_2_aug, 
+       mapping = aes(x = .fitted, y = .resid)) +
+  geom_point(position = "jitter") +
+  geom_hline(yintercept = 0,
+             color = "red", lty = "dashed", size=2) +
+  labs(x = "Predicted", y = "Residuals",
+       title="Residual plot")
+```
+
+In this subsection, we evaluate the residual plot to manually check for undesired patterns in the residuals, which if present, would indicate that a linear model is possibly inappropriate for the dataset. There are no large-scale patterns apparent in the residual plot.
+
+#### Model 3
+This model replaces mileage with vehicle year age in years, for the purpose of evaluating the relative extents to which vehicle registration year and mileage predict vehicle price, and it is an interaction effects model. Once again, brands with fewer than ten observations in the dataset will be eliminated.
+
+```{r model3}
+#Creating Model 3 on auction_train
+model_3 <- lm(sqrtPrice ~ years_old * brand * title_status,
+                    data = auction_train %>% filter(!is.na(hours_left)) %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz")))
+
+tidy_model_3 <- tidy(model_3)
+glance(model_3) %>% select(r.squared,adj.r.squared)
+```
+
+Model 3 returns an r-squared value of 0.506, indicating that it explains 50.6% of the variation in price. This is significantly less than when substituting mileage for vehicle age, even compared to the simpler main effects model, indicating an overly complex model.
+
+```{r model3-augment-RMSE-rsquared}
+#Testing the RMSE for both splits of data
+model_3_aug <- augment(model_3, newdata = (auction_train %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz"))))
+model_3_augR <- augment(model_3, newdata = (auction_test %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz"))))
+
+RMSE3 <- model_3_aug %>% filter(!is.na(.resid)) %>% summarise(RMSE = sqrt(mean(.resid^2)))
+RMSEaug3 <- model_3_augR %>% filter(!is.na(.resid)) %>% summarise(RMSEaug = sqrt(mean(.resid^2)))
+```
+
+Having created model three, we then test it on the testing data and training data. A high discrepancy between the RMSE values for their respective data splits indicates overfitting, which in turn indicates that the model captures too much noise in the training data, such that it has limited success on unseen datasets (in this case, the testing data). Model 3 returns RMSE values of `r RMSE3` and `r RMSEaug3` for the training and testing data, respectively. The small difference indicates that the model is not overfitted.`
+
+```{r model3-residual}
+ggplot(model_3_aug, 
+       mapping = aes(x = .fitted, y = .resid)) +
+  geom_point(position = "jitter") +
+  geom_hline(yintercept = 0,
+             color = "red", lty = "dashed", size=2) +
+  labs(x = "Predicted", y = "Residuals",
+       title="Residual plot")
+```
+
+In this subsection, we evaluate the residual plot to manually check for undesired patterns in the residuals, which if present, would indicate that a linear model is possibly inappropriate for the dataset. There are no large scale patterns, indicating that Model 3 is appropriate for this dataset.
+
+#### Model 4
+
+This model adds the variable "vehicle_body" to Model 1, under the assumption that, even holding all other variables constant, buyers value various types of vehicles differently. 
+```{r model4}
+#Creating Model 1 with the training data
+model_4 <- lm(sqrtPrice ~ sqrtMileage * brand* title_status * vehicle_body,
+                    data = auction_train %>% filter(!is.na(hours_left)) %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz")) %>% filter(!is.na(vehicle_body)))
+
+tidy_model_4 <- tidy(model_4)
+glance(model_4) %>% select(r.squared,adj.r.squared)
+```
+
+Model 4 returns an r-squared value of 0.582, indicating that it explains 58.2% of the variation in price. This indicates that auction buyers do, holding other factors constant, value certain types of vehicles more.
+
+```{r model4-augment-RMSE-rsquared}
+#RMSE for both data splits
+model_4_aug <- augment(model_4, newdata = (auction_train %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz")) %>% filter(!is.na(vehicle_body))))
+model_4_augR <- augment(model_4, newdata = (auction_test %>% filter(brand %in% c("ford","dodge","nissan","chevrolet","gmc","jeep","chrysler","bmw","hyundai","buick","kia","honda","infiniti","cadillac","mercedes-benz")) %>% filter(!is.na(vehicle_body))))
+
+RMSE4 <- model_4_aug %>% filter(!is.na(.resid)) %>% summarise(RMSE = sqrt(mean(.resid^2)))
+RMSEaug4 <- model_4_augR %>% filter(!is.na(.resid)) %>% summarise(RMSEaug = sqrt(mean(.resid^2)))
+```
+
+Next, this subsection tests RMSE values for both the training and testing data, respectively. A high difference between the values would indicate overfitting. Model 4 returns RMSE values for the training and testing datasets of `r RMSE4` and `r RMSEaug4`, respectively, indcating that there is no overfitting problem.
+
+```{r model4-residual}
+#Residual Plot
+ggplot(model_4_aug, 
+       mapping = aes(x = .fitted, y = .resid)) +
+  geom_point(position = "jitter") +
+  geom_hline(yintercept = 0,
+             color = "red", lty = "dashed", size=2) +
+  labs(x = "Predicted", y = "Residuals",
+       title="Residual plot")
+```
+
+This subsection evaluates the residual plot for Model 4. There are no large-scale patterns, indicating that Model 4 is appropriate for the dataset.
+
+#### Model Report
+
+Given that all the models are not overfitted, and appropriate to the dataset, model selection hinges upon comparing their respective predictive capabilities with their complexity. 
+
+Models 1-4, returned r-squared values of, 0.540, 0.508, 0.506, 0.582, and adjusted r-squared values of 0.528, .503, 0.493, aand 0.555, respectively. Model 1, an interaction effects model, thus explains somewhat more of the data than Model 2, a main effects model (both using the same variables). Model 1, using vehicle mileage, also explains more of the variation than Model 3, using vehicle age and the same categorical variables. Adding vehicle body to Model 1, as done in Model 4, increases the number of estimates six-fold, to three-hundred sixty variables. Thus, as per Occam's razor, the extra three-hundred variables are insufficient to justify a 0.042 increase in r-squared.
+
+```{r print-model-1}
+#Square estimates to reverse the square-root transformation, using case_when to preserve negative values.
+tidy_model_1a <- tidy_model_1 %>% mutate(estimate = (case_when(estimate < 0 ~ round(((-1) * (estimate^2)),2),
+                                                              estimate >= 0 ~ round(estimate^2,2))))
+#Rename the estimates to mileage, as appropriate to reversing the transformation
+tidy_model_1b <- lapply(tidy_model_1a[1], gsub, pattern = "sqrtMileage", replacement = "mileage", fixed = TRUE)
+#Apply the new names back into the dataframe
+tidy_model_1c <- tidy_model_1a %>% mutate(term = tidy_model_1b$term)
+print(tidy_model_1c)
+```
+
+As the data has been square-root transformed, the price equation for each brand can be derived by squaring the coefficients while accounting for and preserving negative estimates. The general form therefore is as follows, and can be used to derive equations for each brand. The baseline is a clean vehicle of make BMW, as indicated by BMW's absence in the dummy variables. The estimates may be interpreted as such:
+
+
+$$price = 74631.60 - 0.3(mileage) - 10991.30(brandbuick) - 6858.61(brandchevrolet) - 7150.42(brandchrysler) - 6971.55(branddodge) ... - 0.07(mileage)(brandnissan)(salvage\_insurance)$$
+
+The intercept indicates that the expected price, on average, of a clean BMW vehicle with no mileage is 74631.60 USD. 
+
+The estimate for mileage indicates that every unit increase in mileage, it is expected, on average, holding all other variables constant, that vehicle price of a BMW should decrease by 0.30 USD.
+
+The estimates for brand indicate that for each respective brand, it is expected, on average, holding all other variables constant, that vehicle price should change by the amount indicated in the respective estimate, relative to a BMW vehicle.
+
+Brand     | Price Change (relative to BMW)
+----------|--------------------------------------
+Buick     | -10,991.30 USD
+Cadillac  | -61.42 USD
+Chevrolet | -6858.61 USD
+Chrysler  | -7150.42 USD
+Dodge     | -6971.55 USD
+Ford      | -6545.86 USD
+GMC       | -14976.46 USD
+Honda     | -43238.85 USD
+Hyundai   | -41297.37 USD
+Infiniti  | -29142.26 USD
+Jeep      | -24918.54 USD
+Kia       | -32949.74 USD
+Mercedes  | 154.37 USD
+Nissan    | -17720.68 USD
+
+The estimate for title_status:salvage insurance indicates that totaled BMW vehicles are expected, on average, holding all other variables constant, to have vehicle price lower by 32897.53 USD.
+
+The estimates for mileage:brand indicate the how much the expected change in price per unit increase in mileage, changes based on vehicle brand, relative to a BMW vehicle. 
+
+Brand     | Price Change (per unit increase in mileage) (relative to figure for BMW)
+----------|-------------------------
+Buick     | 0.15 USD
+Cadillac  | 0 USD
+Chevrolet | 0.09 USD
+Chrysler  | 0.04 USD
+Dodge     | 0.06 USD
+Ford      | 0.09 USD
+GMC       | 0.11 USD
+Honda     | 0.05 USD
+Hyundai   | 0.3 USD
+Infiniti  | 0.4 USD
+Jeep      | 0.35 USD
+Kia       | 0.4 USD
+Mercedes  | 0 USD
+Nissan    | 0.15 USD
+
+The estimates for brand:title_statussalvage insurance indicate that it is estimated, on average, holding all other variables constant, that a totaled vehicle will have the respective *additional* price change relative to how much a clean vehicle of the same brand decreases in price. 
+
+Brand     | Price Change (relative to clean vehicle of same brand)
+----------|--------------------------------------------------------
+Buick     | -4195.00 USD
+Cadillac  | -323.09 USD
+Chevrolet | 7.45 USD
+Chrysler  | -1398.12 USD
+Dodge     | 19970.24 USD
+Ford      | 4023.57 USD
+GMC       | 1048.37 USD
+Honda     | (N/A - No totaled Honda Vehicles)
+Hyundai   | (N/A)
+Infiniti  | (N/A)
+Jeep      | 11464.81 USD
+Kia       | -7365.24 USD
+Mercedes  | (N/A)
+Nissan    | 10773.55 USD
+
+The estimate for mileage:title_statussalvage insurance indicate that it is estimated, on average, holding all other variables constant, that relative to a clean BMW, a wrecked BMW's rate of price decrease per unit increase in mileage is 0.14 USD less.
+
+The estimates for mileage:brand:title_statussalvage insurance indicate that it is estimated, on average, that how much price decreases per unit increase mileage will change as indicated by the respective estimate if the vehicle is from the respective brand *and* totaled, relative to how much a clean vehicle's price decreases per mile, which is in turn relative to how much a clean BMW's price decreases per mile.
+
+Brand     | Price Change per Unit Increase in Mileage (relative to clean vehicle of same brand)
+----------|--------------------------------------------------------
+Buick     | (N/A - only one totaled Buick)
+Cadillac  | (N/A)
+Chevrolet | -0.2 USD
+Chrysler  | 0 USD
+Dodge     | -0.13 USD
+Ford      | -0.05 USD
+GMC       | -0.02 USD
+Honda     | (N/A)
+Hyundai   | (N/A)
+Infiniti  | (N/A)
+Jeep      | -0.16 USD
+Kia       | (N/A)
+Mercedes  | (N/A)
+Nissan    | -0.07 USD
+
+
+For instance, the equation for a wrecked Chevrolet is as follows.
+$$price = 74631.60 - 0.30(mileage) - 6858.61(1) - 32897.53(1) + 0.09(mileage) + 0.14(mileage)(1) + 7.45(1)(1) - 0.02(mileage)(1)(1)$$
+$$price = 34882.91 - 0.09(mileage)$$
+For instance, the equation for a clean Ford is as follows.
+$$price = 74631.60 - 0.30(mileage) - 6545.86 + 0.09(mileage) + 0.14(mileage)(0) - 4023.57(0)(1) -0.05(0)(1)$$
+$$price = 68085.74 - 0.21(mileage)$$
+
+### Inference Testing I: Price as Correlated with Title Status
+In this section, we evaluate how cars with difference title statuses differ in their price. Given the wide range of estimates in the linear model - due to somewhat smaller sample sizes when vehicles with salvage title status are disaggregated by brand, this inference test serves an important role in estimating a general confidence interval for insurance salvage vehicles.
+
+#### Relationsip exploration
+We visualize the relationship with a side-by-side box plot displaying the relationship between `title_status` and `price` of the vehicles listed on _Auction Export.com_.
+
+```{r box-plot}
+# make box plot
+ggplot(data = auction_df,
+       mapping = aes(x = price, fill = title_status)) +
+  geom_boxplot() +
+  labs(title = "Relationship between Title Status and Price",
+       x = "Price",
+       fill = "Title Status") +
+  theme(axis.ticks.y = element_blank(),
+        axis.text.y = element_blank())
+```
+
+```{r price-statistics}
+# calculate summary statistics
+# clean vehicle
+auction_df %>% 
+  filter(title_status == "clean vehicle") %>% 
+  summarise(mean_price = mean(price),
+            median_price = median(price),
+            iqr_price = IQR(price))
+# salvage insurance
+auction_df %>%
+  filter(title_status == "salvage insurance") %>%
+  summarise(mean_price = mean(price),
+            median_price = median(price),
+            iqr_price = IQR(price))
+```
+
+We calculate the mean and median `price` for cars in clean vehicle status and cars in salvage insurance status. As the price data is skewed right and unimodal, the median and IQR are more accurate measures of center than mean and standard deviation. Clean vehicles have a median price of 18000 USD and IQR of 14765 USD, whereas salvage insurance insurance vehicles have median price of 825 USD and IQR of 2700 USD. 
+
+#### Bootstrap calculation
+In order to evaluate variability, we use `bootstrap` to quantify the uncertainty in the sample estimates, visualize the `bootstrap` distribution, and calculate a 95% confidence interval.
+```{r bootstrapping}
+# set seed
+set.seed(500)
+
+# create bootstrap
+boot_diff_mean <- auction_df %>%
+  specify(price ~ title_status) %>%
+  generate(reps = 5000, type = "bootstrap") %>%
+  calculate(stat = "diff in medians",
+            order = c("clean vehicle", "salvage insurance"))
+
+# visualize bootstrap
+boot_diff_mean %>% visualise()
+
+# calculate confidence interval
+boot_diff_mean %>% get_confidence_interval(level = 0.95)
+```
+
+#### Conclusion
+According to the box plots above, the middle half of values of `price` for cars with clean vehicle status is much higher than that of cars with salvage insurance status; also, according to the calculated summaries, vehicles with clean vehicle statuses are more expensive and vary more in price with median price of 18000 USD and IQR of 14765 USD, compared to a median of 825 USD and IQR of 2700 USD for salvage insurance vehicles. In lay terms, vehicle buyers are willing to pay less for wrecked vehicles and care less about other aspects of wrecked vehicles' condition.
+
+We are 95% confident that, in the population, the average price difference that the difference between prices of cars with clean vehicle statuses and salvage insurance statuses is greater than 16200 and smaller than 17886 dollars. This value differs from the linear model's estimate due to the latter's variables of brand and mileage, but does confirm that there is a strong positive correlation between price and the vehicle having a clean status.
+
+### Inference Testing II: Price as Correlated with Vehicle Type
+In this section we how evaluate different vehicle types differ in their price.
+
+#### Recoding Values
+First, we need to recode `vehicle_body` as a new variable called `vehicle_type` which takes classifies commercial vehicles, vans, suv's, and pickup trucks as large vehicles, and sports coupes, sedans, and compact vehicles as small.
+```{r recode-vehicle-bldy}
+auction_df <- auction_df %>%
+  mutate(vehicle_type = case_when(vehicle_body %in% c("van_suv", "commercial", "truck") ~ "large",
+                                  vehicle_body %in% c("sports", "sedan", "compact") ~ "small"))
+```
+
+#### Relationship Exploration
+We visualize the relationship with a side-by-side box plot displaying the relationship between `vehicle_type` and `price`. 
+```{r plotting}
+ggplot(data = auction_df %>% filter(!is.na(vehicle_type)),
+       mapping = aes(x = price, fill = vehicle_type)) +
+  geom_boxplot() +
+  labs(title = "Relationship Between Vehicle Type and Price",
+       x = "Price",
+       y = "Vehicle Type",
+       fill = "Vehicle Type") +
+  theme(axis.ticks.y = element_blank(),
+        axis.text.y = element_blank())
+
+ggplot(data = auction_df %>% filter(!is.na(vehicle_type)), mapping = aes(x = price)) + 
+  facet_wrap(~vehicle_type) +
+  geom_histogram() +
+  labs(title = "Distribution of Auction Price",
+       x = "Price",
+       y = "Count",
+       subtitle = "Faceted by Vehicle Size")
+```
+
+The boxplots indicate that median price is higher for large vehicles, and the histograms indicate that the data is skewed right. 
+```{r price-statistics2}
+auction_df %>% 
+  filter(!is.na(vehicle_type), vehicle_type == "large") %>%
+  summarise(mean_price = mean(price),
+            median_price = median(price),
+            IQR_price = IQR(price))
+
+auction_df %>%
+  filter(!is.na(vehicle_type), vehicle_type == "small") %>%
+  summarise(mean_price = mean(price),
+            median_price = median(price),
+            IQR_price = IQR(price))
+```
+
+We calculate the mean and median `price` for large vehicles and small cars. As the price data is skewed right, the median and IQR are more accurate measures of center than mean and standard deviation. Thus, within the sample, large vehicles have a median price of 20000 USD and IQR of 15602 USD, whereas salvage insurance insurance vehicles have median price of 15300 USD and IQR of 9000 USD. 
+
+#### Bootstrap calculation
+```{r bootstrapping2}
+set.seed(500)
+
+boot_diff_mean_2 <- auction_df %>%
+  filter(!is.na(vehicle_type)) %>%
+  specify(price ~ vehicle_type) %>%
+  generate(reps = 5000, type = "bootstrap") %>%
+  calculate(stat = "diff in medians",
+            order = c("large", "small"))
+
+boot_diff_mean_2 %>% visualize()
+
+boot_diff_mean_2 %>% get_confidence_interval(level = 0.95)
+```
+
+#### Conclusion
+According to the box plots above, the middle half of values of `price` for large vehicles is considerably higher than that of small vehicles; as per the measures of center, large vehicles in the sample are more expensive and vary more in price with median price of 20000 USD and IQR of 15602 USD, compared to a median of 15300 USD and IQR of 9000 USD for small vehicles. In lay terms, vehicle buyers are willing to pay more for large vehicles and care more about other aspects of large vehicles' condition.
+
+We are 95% confident that the average price difference in the population, of large vehicles relative to small vehicles, is greater than 3600 and smaller than 6200 dollars. 
+
+## Conclusion
+  This project examined the dataset `auction_df` by constructing four candidate linear models and two inference tests. Of the candidate models, Model 1, an interaction effects model that utilized the continuous variable mileage (square-root transformed) and the categorical variables brand and vehicle title status, explained 54.0% of the variance in price while maintaining reasonable simplicity. The first inference test concerned the relationship between vehicle status and price. Bootstrap sampling indicated that there could be 95% confidence that, in the population, vehicles with clean statuses were from 16200 and 17886 USD more expensive than vehicles listed as salvage insurance. The second test concerned the relationship between vehicle size and price. Bootstrap sampling indicated a 95% confidence that, in the population, large vehicles’ prices are from 3600 to 6200 USD higher than for small vehicles. Thus, we conclude that price is negatively correlated with mileage, can change based on vehicle condition and vehicle brand, and his higher for larger vehicles.
+<br>
+	Nevertheless, the analysis contains several limitations, primarily relating to the scraping of data. Firstly, the dataset was scraped from a single auction website, possibly introducing confounding variables and sampling biases that may decrease the extent to which the dataset reflects the general population. For instance, perhaps buyer behavioral patterns differ between online auctions and dealerships, or different selections of vehicles are sold on online auctions compared to dealerships. Secondly, the sample of two-thousand five-hundred observations is small compared to the number of vehicles in the US, increasing the risk for sampling errors, and thereby making the sample unrepresentative of the population and weakening the hypothesis tests’ conclusions. Thirdly, within the dataset, several variables skew towards certain values – for instance, Ford comprised roughly half the values of brand, this having implications for the validity of model estimates for other values. Finally, a variable crucial to the second hypothesis test, model, and therefore vehicle type, were scraped incorrectly, leading to an increased proportion of NA values. An improved analysis would primarily center upon more accurate scraping of a wider sample, which would eliminate the aforementioned possible confounders.
